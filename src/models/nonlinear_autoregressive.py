@@ -1,4 +1,5 @@
 import warnings
+import holidays
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
@@ -12,74 +13,184 @@ class NonLinearAutoRegressive:
     def __init__(
         self,
         params: dict,
-        context_length: int,
-        lag: int = 0,
+        country: str,
+        context_lags: list = None,
         prediction_length: int = 1,
     ):
         self.params = params
+        self.country = country
 
         if "linear_tree" in self.params:
             self.dataset_params = {"linear_tree": self.params.pop("linear_tree")}
         else:
             self.dataset_params = None
 
-        self.context_length = context_length
+        self.context_lags = context_lags
         self.prediction_length = prediction_length
-        self.lag = lag
 
-    def prepare_xy(self, dataset: pd.DataFrame) -> tuple[pd.DataFrame]:
+    def validate_dataset(self, dataset: pd.DataFrame) -> pd.DataFrame:
+        # make a copy of the dataset to make sure not to alter the original
+        dataset = dataset.copy()
+
+        # check that column list is correct
+        if hasattr(self, "targets"):
+            if self.targets != dataset.columns.tolist():
+                raise ValueError(f"Target list should be {self.targets}")
+        else:
+            self.targets = dataset.columns.tolist()
+
+        # name the column index
+        if dataset.columns.name is not None:
+            if hasattr(self, "targets_name"):
+                if self.targets_name != dataset.columns.name:
+                    raise ValueError(f"Column index name should be {self.targets_name}")
+            else:
+                self.targets_name = dataset.columns.name
+        else:
+            self.targets_name = "targets"
+            dataset.columns.name = self.targets_name
+
+        # name the index
+        if dataset.index.name is not None:
+            if hasattr(self, "index_name"):
+                if self.index_name != dataset.index.name:
+                    raise ValueError(f"Index name should be {self.targets_name}")
+            else:
+                self.index_name = dataset.index.name
+        else:
+            self.index_name = "datetime"
+            dataset.index.name = self.index_name
+
+        # detect dataset frequency
         if not hasattr(self, "timestep"):
             self.timestep = dataset.index[1] - dataset.index[0]
+        else:
+            if self.timestep != dataset.index[1] - dataset.index[0]:
+                raise ValueError(f"Dataset time frequency should be {self.timestep}")
+
+        return dataset
+
+    def expand_df(self, df: pd.DataFrame, labels: list, name: str):
+        # repeat matrix n times
+        dfdf = pd.concat({i: df for i in labels}, axis=1, names=[name])
+        return dfdf
+
+    def prepare_xy(self, dataset: pd.DataFrame) -> tuple[pd.DataFrame]:
+        dataset = self.validate_dataset(dataset)
+        cal_info = self.get_calendar_features(dataset.index)
+
         x = {}
-        for i in range(self.context_length):
-            x[i + self.lag] = dataset.shift(i + 1 + self.lag).dropna()
-        x = pd.concat(x, axis=1).dropna()
-        y = dataset.reindex(x.index)
+        for i in self.context_lags:
+            x[i] = dataset.shift(i + 1).dropna()
+
+        y = {}
+        cal = {}
+        for j in range(self.prediction_length):
+            y[j] = dataset.shift(-j).dropna()
+            cal[j] = cal_info.shift(-j).dropna()
+
+        x = pd.concat(x, axis=1, names=["features"]).dropna()
+        y = pd.concat(y, axis=1, names=["horizon"]).dropna()
+        cal = pd.concat(cal, axis=1, names=["horizon"]).dropna()
+        idx = x.index.intersection(y.index).intersection(cal.index)
+        x, y, cal = x.reindex(idx), y.reindex(idx), cal.reindex(idx)
+
+        x = self.expand_df(x, range(self.prediction_length), "horizon")
+        cal = self.expand_df(cal, self.targets, self.targets_name)
+        x = pd.concat(
+            [
+                x.stack("horizon", future_stack=True),
+                cal.stack("horizon", future_stack=True).swaplevel(axis=1),
+            ],
+            axis=1,
+        ).unstack("horizon")
+
+        self.target_dimensions = [l.name for l in y.columns.levels]
+        x = x.stack(self.target_dimensions, future_stack=True)
+        y = y.stack(self.target_dimensions, future_stack=True).reindex(x.index)
         return x, y
 
-    def get_stacked_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
-        self.cat_feature_name = (
-            y.columns.name if y.columns.name is not None else "index"
+    def get_calendar_features(self, index: pd.DatetimeIndex) -> pd.DataFrame:
+        holiday_dict = holidays.country_holidays(self.country)
+        hour = index.hour
+        weekday = index.weekday
+        is_holiday = pd.Series([d in holiday_dict for d in index.date], index=index)
+        cal_df = pd.DataFrame(
+            {"hour": hour, "weekday": weekday, "is_holiday": is_holiday}
         )
+        cal_df.columns.name = "features"
+        self.calendar_features = cal_df.columns.tolist()
+        return cal_df
 
-        x = x.stack(future_stack=True).reset_index(level=1)
-        x[self.cat_feature_name] = x[self.cat_feature_name].astype("category")
-        if y is not None:
-            y = y.stack(future_stack=True)
+    def get_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
+        x = x.reset_index(self.target_dimensions)
+        x[self.target_dimensions + self.calendar_features] = x[
+            self.target_dimensions + self.calendar_features
+        ].astype("category")
+
         data = lgb.Dataset(
             x,
             label=y,
             params=self.dataset_params,
-            categorical_feature=[self.cat_feature_name],
             free_raw_data=False,
         )
         return data
 
     def fit(self, dataset: pd.DataFrame):
-        self.x, self.y = self.prepare_xy(dataset)
-        self.train_data = self.get_stacked_dataset(self.x, self.y)
+        x, y = self.prepare_xy(dataset)
+        self.train_data = self.get_dataset(x, y)
         with warnings.catch_warnings(action="ignore"):
             self.model = lgb.train(self.params, self.train_data)
 
+    def prepare_x_pred(
+        self, dataset: pd.DataFrame, cal_features: pd.DataFrame
+    ) -> pd.DataFrame:
+
+        x_pred = dataset.iloc[[-i - 1 for i in self.context_lags]].copy()
+        x_pred = x_pred.T.sort_index(axis=1, ascending=False)
+        x_pred.columns = pd.Index(self.context_lags, name="features")
+        x_pred = self.expand_df(x_pred, range(self.prediction_length), "horizon")
+        cal_features = self.expand_df(cal_features, self.targets, self.targets_name)
+
+        x_pred = x_pred.stack("horizon", future_stack=True)
+        x_pred = x_pred.join(
+            cal_features.stack(self.targets_name, future_stack=True)
+        ).reset_index()
+        x_pred[self.target_dimensions + self.calendar_features] = x_pred[
+            self.target_dimensions + self.calendar_features
+        ].astype("category")
+        return x_pred
+
     def predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
         # make a copy of the dataset to make sure not to alter the original
-        dataset = dataset.copy()
+        dataset = self.validate_dataset(dataset)
+        n_timesteps = steps * self.prediction_length
+        dtrange = pd.date_range(
+            start=dataset.index[-1] + self.timestep,
+            end=dataset.index[-1] + self.timestep * n_timesteps,
+            periods=n_timesteps,
+        )
+        cal_features = self.get_calendar_features(dtrange)
 
-        preds = {}
-        for _ in range(steps):
-            dt = dataset.index[-1] + self.timestep
-            x_pred = dataset.iloc[-self.context_length :].copy()
-            x_pred = x_pred.T.sort_index(axis=1, ascending=False)
-            x_pred.columns = range(self.lag, self.lag + self.context_length)
-            x_pred = x_pred.reset_index()
-            x_pred[self.cat_feature_name] = x_pred[self.cat_feature_name].astype(
-                "category"
+        preds = []
+        for i in range(steps):
+            this_cal_features = cal_features.iloc[
+                i * self.prediction_length : (i + 1) * self.prediction_length
+            ].reset_index(drop=True)
+            this_cal_features.index.name = "horizon"
+
+            x_pred = self.prepare_x_pred(dataset, this_cal_features)
+
+            this_pred = pd.Series(
+                self.model.predict(x_pred),
+                index=x_pred.set_index(self.target_dimensions).index,
+            ).unstack()
+            this_pred.index = dataset.index[-1] + (
+                self.timestep * (this_pred.index.astype(int) + 1)
             )
-            preds[dt] = pd.Series(
-                self.model.predict(x_pred), index=x_pred[self.cat_feature_name]
-            )
-            dataset.loc[dt] = preds[dt].values
-        preds = pd.concat(preds, axis=1).T
+            preds.append(this_pred)
+            dataset = pd.concat([dataset, this_pred])
+        preds = pd.concat(preds)
         return preds
 
     def fit_predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
@@ -94,37 +205,44 @@ class NonLinearAutoRegressive:
         gap: int,
         **kwargs,
     ) -> pd.DataFrame:
+
         tscv = TimeSeriesSplit(
             n_splits=cv_splits, max_train_size=max_train_size, gap=gap, **kwargs
         )
         x, y = self.prepare_xy(dataset)
+        # in timeseries shape
+        ts_x = x.unstack(["horizon", self.targets_name])
 
-        score = pd.DataFrame()
-        for split, (train_index, test_index) in enumerate(tscv.split(x)):
+        score = {}
+        for split, (train_index, test_index) in enumerate(tscv.split(ts_x)):
             print(
                 f"Evaluating fold number {split+1}. "
                 f"{len(train_index)} training rows and {len(test_index)} testing.",
                 end="\r",
             )
-            x_train = x.iloc[train_index].copy()
-            x_test = x.iloc[test_index].copy()
+            x_train = ts_x.iloc[train_index].stack(
+                ["horizon", self.targets_name], future_stack=True
+            )
+            x_test = ts_x.iloc[test_index].stack(
+                ["horizon", self.targets_name], future_stack=True
+            )
             y_train = y.reindex(x_train.index)
             y_test = y.reindex(x_test.index)
 
-            train_data = self.get_stacked_dataset(x_train, y_train)
-            test_data = self.get_stacked_dataset(x_test, y_test)
+            train_data = self.get_dataset(x_train, y_train)
+            test_data = self.get_dataset(x_test, y_test)
             with warnings.catch_warnings(action="ignore"):
                 self.model = lgb.train(self.params, train_data, valid_sets=[test_data])
 
             raw_test_data = test_data.get_data()
-            test_index = raw_test_data.set_index(
-                train_data.categorical_feature, append=True
-            ).index
             self.y_pred = pd.Series(
-                self.model.predict(raw_test_data), index=test_index
-            ).unstack()
+                self.model.predict(raw_test_data), index=y_test.index
+            )
 
-            rel_rmse = ((y_test - self.y_pred) ** 2).mean() ** 0.5 / y_test.abs().mean()
+            groupby = ["horizon", self.targets_name]
+            rel_rmse = ((y_test - self.y_pred) ** 2).groupby(
+                level=groupby
+            ).mean() ** 0.5 / y_test.abs().groupby(level=groupby).mean()
             score[split] = rel_rmse
         print("")
-        return score
+        return pd.concat(score, axis=1, names=["fold"])
