@@ -5,7 +5,7 @@ from matplotlib import pyplot as plt
 from src.models import *
 from src.data import get_danish_industry_consumption
 
-df = get_danish_industry_consumption()
+df = get_danish_industry_consumption()[["Privat"]]
 params = {
     "objective": "regression",
     "metric": "rmse",
@@ -31,7 +31,7 @@ model = NonLinearAutoRegressive(
 print("Fitting model")
 model.fit(df)
 print("Predicting")
-pred = model.predict(df, steps=3)
+pred = model.predict(steps=3)
 
 ax = pred.plot(linestyle="--", legend=False)
 df.tail(200).plot(ax=ax, legend=False)

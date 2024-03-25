@@ -125,6 +125,9 @@ class NonLinearAutoRegressive:
 
     def fit(self, dataset: pd.DataFrame):
         x, y = self.prepare_xy(dataset)
+        self.dataset = dataset.copy()
+        x.to_pickle("x-new.pkl")
+        y.to_pickle("x-new.pkl")
 
         self.train_data = self.get_dataset(x, y)
         with warnings.catch_warnings(action="ignore"):
@@ -149,13 +152,11 @@ class NonLinearAutoRegressive:
         )
         return x_pred.reindex(self.x_columns, axis=1)
 
-    def predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
-        # make a copy of the dataset to make sure not to alter the original
-        dataset = self.validate_dataset(dataset)
+    def predict(self, steps: int = 1) -> pd.DataFrame:
         n_timesteps = steps * self.prediction_length
         dtrange = pd.date_range(
-            start=dataset.index[-1] + self.timestep,
-            end=dataset.index[-1] + self.timestep * n_timesteps,
+            start=self.dataset.index[-1] + self.timestep,
+            end=self.dataset.index[-1] + self.timestep * n_timesteps,
             periods=n_timesteps,
         )
         cal_features = self.get_calendar_features(dtrange)
@@ -167,7 +168,8 @@ class NonLinearAutoRegressive:
             ].reset_index(drop=True)
             this_cal_features.index.name = "horizon"
 
-            x_pred = self.prepare_x_pred(dataset, this_cal_features)
+            x_pred = self.prepare_x_pred(self.dataset, this_cal_features)
+            x_pred.to_pickle("x_pred-new.pkl")
             this_pred = (
                 pd.Series(
                     self.model.predict(x_pred),
@@ -176,17 +178,17 @@ class NonLinearAutoRegressive:
                 .unstack()
                 .sort_index()
             )
-            this_pred.index = dataset.index[-1] + (
+            this_pred.index = self.dataset.index[-1] + (
                 self.timestep * (this_pred.index.astype(int) + 1)
             )
             preds.append(this_pred)
-            dataset = pd.concat([dataset, this_pred])
+            self.dataset = pd.concat([self.dataset, this_pred])
         preds = pd.concat(preds).sort_index()
         return preds
 
     def fit_predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
         self.fit(dataset)
-        return self.predict(dataset, steps)
+        return self.predict(steps)
 
     def evaluate(
         self,
