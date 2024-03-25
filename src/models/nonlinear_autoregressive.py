@@ -84,30 +84,30 @@ class NonLinearAutoRegressive:
             x[i] = dataset.shift(i + 1).dropna()
 
         y = {}
-        cal = {}
+        dataset.index = pd.MultiIndex.from_frame(cal_info.reset_index())
         for j in range(self.prediction_length):
             y[j] = dataset.shift(-j).dropna()
-            cal[j] = cal_info.shift(-j).dropna()
 
         x = pd.concat(x, axis=1, names=["features"]).dropna()
         y = pd.concat(y, axis=1, names=["horizon"]).dropna()
-        cal = pd.concat(cal, axis=1, names=["horizon"]).dropna()
-        idx = x.index.intersection(y.index).intersection(cal.index)
-        x, y, cal = x.reindex(idx), y.reindex(idx), cal.reindex(idx)
 
-        x = self.expand_df(x, range(self.prediction_length), "horizon")
-        cal = self.expand_df(cal, self.targets, self.targets_name)
-        x = pd.concat(
-            [
-                x.stack("horizon", future_stack=True),
-                cal.stack("horizon", future_stack=True).swaplevel(axis=1),
-            ],
-            axis=1,
-        ).unstack("horizon")
+        # TODO can probably avoid this stack (taking a lot of memory) by stacking in loop
+        x = x.stack(self.targets_name, future_stack=True).reset_index()
+        y = (
+            y.stack([self.targets_name, "horizon"], future_stack=True)
+            .to_frame("value")
+            .reset_index()
+        )
+        x = x.merge(y, how="right", on=[self.index_name, self.targets_name]).dropna()
 
-        self.target_dimensions = [l.name for l in y.columns.levels]
-        x = x.stack(self.target_dimensions, future_stack=True)
-        y = y.stack(self.target_dimensions, future_stack=True).reindex(x.index)
+        self.categorical_features = self.calendar_features + [
+            self.targets_name,
+            "horizon",
+        ]
+        x[self.categorical_features] = x[self.categorical_features].astype("category")
+        y = x.set_index([self.index_name, self.targets_name, "horizon"])["value"]
+        x = x.drop([self.index_name, "value"], axis=1)
+        x.index = y.index
         return x, y
 
     def get_calendar_features(self, index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -123,11 +123,6 @@ class NonLinearAutoRegressive:
         return cal_df
 
     def get_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
-        x = x.reset_index(self.target_dimensions)
-        x[self.target_dimensions + self.calendar_features] = x[
-            self.target_dimensions + self.calendar_features
-        ].astype("category")
-
         data = lgb.Dataset(
             x,
             label=y,
@@ -138,6 +133,7 @@ class NonLinearAutoRegressive:
 
     def fit(self, dataset: pd.DataFrame):
         x, y = self.prepare_xy(dataset)
+
         self.train_data = self.get_dataset(x, y)
         with warnings.catch_warnings(action="ignore"):
             self.model = lgb.train(self.params, self.train_data)
@@ -156,9 +152,9 @@ class NonLinearAutoRegressive:
         x_pred = x_pred.join(
             cal_features.stack(self.targets_name, future_stack=True)
         ).reset_index()
-        x_pred[self.target_dimensions + self.calendar_features] = x_pred[
-            self.target_dimensions + self.calendar_features
-        ].astype("category")
+        x_pred[self.categorical_features] = x_pred[self.categorical_features].astype(
+            "category"
+        )
         return x_pred
 
     def predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
@@ -180,10 +176,9 @@ class NonLinearAutoRegressive:
             this_cal_features.index.name = "horizon"
 
             x_pred = self.prepare_x_pred(dataset, this_cal_features)
-
             this_pred = pd.Series(
                 self.model.predict(x_pred),
-                index=x_pred.set_index(self.target_dimensions).index,
+                index=x_pred.set_index(["horizon", self.targets_name]).index,
             ).unstack()
             this_pred.index = dataset.index[-1] + (
                 self.timestep * (this_pred.index.astype(int) + 1)
@@ -210,22 +205,20 @@ class NonLinearAutoRegressive:
             n_splits=cv_splits, max_train_size=max_train_size, gap=gap, **kwargs
         )
         x, y = self.prepare_xy(dataset)
-        # in timeseries shape
-        ts_x = x.unstack(["horizon", self.targets_name])
+        x, y = x.sort_index(), y.sort_index()
+        dts = y.reset_index()[self.index_name].unique()
 
         score = {}
-        for split, (train_index, test_index) in enumerate(tscv.split(ts_x)):
+        for split, (train_index, test_index) in enumerate(tscv.split(dts)):
             print(
                 f"Evaluating fold number {split+1}. "
-                f"{len(train_index)} training rows and {len(test_index)} testing.",
+                f"{len(train_index)} training timesteps and {len(test_index)} testing.",
                 end="\r",
             )
-            x_train = ts_x.iloc[train_index].stack(
-                ["horizon", self.targets_name], future_stack=True
-            )
-            x_test = ts_x.iloc[test_index].stack(
-                ["horizon", self.targets_name], future_stack=True
-            )
+            train_dts = dts[train_index]
+            test_dts = dts[test_index]
+            x_train = x.truncate(train_dts[0], train_dts[-1])
+            x_test = x.truncate(test_dts[0], test_dts[-1])
             y_train = y.reindex(x_train.index)
             y_test = y.reindex(x_test.index)
 
@@ -240,9 +233,10 @@ class NonLinearAutoRegressive:
             )
 
             groupby = ["horizon", self.targets_name]
+
             rel_rmse = ((y_test - self.y_pred) ** 2).groupby(
-                level=groupby
-            ).mean() ** 0.5 / y_test.abs().groupby(level=groupby).mean()
+                level=groupby, observed=False
+            ).mean() ** 0.5 / y_test.abs().groupby(level=groupby, observed=False).mean()
             score[split] = rel_rmse
         print("")
         return pd.concat(score, axis=1, names=["fold"])
