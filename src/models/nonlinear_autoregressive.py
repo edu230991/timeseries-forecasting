@@ -6,10 +6,6 @@ from sklearn.model_selection import TimeSeriesSplit
 
 
 class NonLinearAutoRegressive:
-    # TODO
-    # include other categorical features (holidays, weekday)
-    # enable multi-output instead of looping. can turn it into single-output by using cat features
-
     def __init__(
         self,
         params: dict,
@@ -81,23 +77,18 @@ class NonLinearAutoRegressive:
 
         x = {}
         for i in self.context_lags:
-            x[i] = dataset.shift(i + 1).dropna()
+            x[i] = dataset.shift(i + 1).dropna().stack(future_stack=True)
 
         y = {}
         dataset.index = pd.MultiIndex.from_frame(cal_info.reset_index())
         for j in range(self.prediction_length):
-            y[j] = dataset.shift(-j).dropna()
+            y[j] = dataset.shift(-j).dropna().stack(future_stack=True)
 
         x = pd.concat(x, axis=1, names=["features"]).dropna()
-        y = pd.concat(y, axis=1, names=["horizon"]).dropna()
+        y = pd.concat(y, axis=0, names=["horizon"]).dropna()
 
-        # TODO can probably avoid this stack (taking a lot of memory) by stacking in loop
-        x = x.stack(self.targets_name, future_stack=True).reset_index()
-        y = (
-            y.stack([self.targets_name, "horizon"], future_stack=True)
-            .to_frame("value")
-            .reset_index()
-        )
+        x = x.reset_index()
+        y = y.to_frame("value").reset_index()
         x = x.merge(y, how="right", on=[self.index_name, self.targets_name]).dropna()
 
         self.categorical_features = self.calendar_features + [
@@ -117,12 +108,13 @@ class NonLinearAutoRegressive:
         is_holiday = pd.Series([d in holiday_dict for d in index.date], index=index)
         cal_df = pd.DataFrame(
             {"hour": hour, "weekday": weekday, "is_holiday": is_holiday}
-        )
+        ).astype(int)
         cal_df.columns.name = "features"
         self.calendar_features = cal_df.columns.tolist()
         return cal_df
 
     def get_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
+        self.x_columns = x.columns
         data = lgb.Dataset(
             x,
             label=y,
@@ -155,7 +147,7 @@ class NonLinearAutoRegressive:
         x_pred[self.categorical_features] = x_pred[self.categorical_features].astype(
             "category"
         )
-        return x_pred
+        return x_pred.reindex(self.x_columns, axis=1)
 
     def predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
         # make a copy of the dataset to make sure not to alter the original
@@ -176,16 +168,20 @@ class NonLinearAutoRegressive:
             this_cal_features.index.name = "horizon"
 
             x_pred = self.prepare_x_pred(dataset, this_cal_features)
-            this_pred = pd.Series(
-                self.model.predict(x_pred),
-                index=x_pred.set_index(["horizon", self.targets_name]).index,
-            ).unstack()
+            this_pred = (
+                pd.Series(
+                    self.model.predict(x_pred),
+                    index=x_pred.set_index(["horizon", self.targets_name]).index,
+                )
+                .unstack()
+                .sort_index()
+            )
             this_pred.index = dataset.index[-1] + (
                 self.timestep * (this_pred.index.astype(int) + 1)
             )
             preds.append(this_pred)
             dataset = pd.concat([dataset, this_pred])
-        preds = pd.concat(preds)
+        preds = pd.concat(preds).sort_index()
         return preds
 
     def fit_predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:

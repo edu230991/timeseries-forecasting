@@ -1,39 +1,68 @@
+import itertools
 import pandas as pd
 from matplotlib import pyplot as plt
 
 from src.models import *
 from src.data import get_danish_industry_consumption
 
-df = get_danish_industry_consumption()[["Privat"]]
+df = get_danish_industry_consumption()
 params = {
     "objective": "regression",
     "metric": "rmse",
-    "num_leaves": 100,
-    "min_child_samples": 100,
-    "num_boost_round": 10,
+    "num_leaves": 50,
+    "min_child_samples": 1000,
+    "max_depth": 10,
+    "num_boost_round": 200,
     "learning_rate": 0.1,
     "verbosity": -1,
     "linear_tree": True,
 }
-prediction_length = 6
-context_lags = list(range(48, 72)) + list(range(168, 168 + 24))
+
+prediction_length = 24
+context_lags = list(range(48, 73)) + list(range(168, 168 + 25))
+
 model = NonLinearAutoRegressive(
     context_lags=context_lags,
     country="Denmark",
     prediction_length=prediction_length,
     params=params,
 )
-# score = model.evaluate(df, cv_splits=4, max_train_size=10000, gap=48)
-# print("Score:", round(score.mean().mean(), 2))
 
 print("Fitting model")
 model.fit(df)
 print("Predicting")
-pred = model.predict(df, steps=4)
+pred = model.predict(df, steps=3)
 
 ax = pred.plot(linestyle="--", legend=False)
 df.tail(200).plot(ax=ax, legend=False)
 plt.show()
+
+# params_grid = {
+#     "num_leaves": [50, 200, 1000],
+#     "min_child_samples": [50, 100, 1000],
+#     "max_depth": [-1, 5, 10],
+#     "num_boost_round": [100, 200],
+# }
+# scores = pd.DataFrame()
+# for values in itertools.product(*params_grid.values()):
+#     new_params = params.copy()
+#     point = dict(zip(params_grid.keys(), values))
+#     new_params.update(point)
+#     model = NonLinearAutoRegressive(
+#         context_lags=context_lags,
+#         country="Denmark",
+#         prediction_length=prediction_length,
+#         params=new_params,
+#     )
+
+#     score = model.evaluate(df, cv_splits=3, max_train_size=10000, gap=48)
+#     point["score"] = round(score.mean().mean(), 4)
+#     scores = (
+#         pd.concat((scores, pd.Series(point).to_frame().T))
+#         .sort_values("scores")
+#         .reset_index()
+#     )
+#     print(scores)
 
 import ipdb
 
