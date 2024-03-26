@@ -1,88 +1,85 @@
-import itertools
+import os
 import pandas as pd
 from matplotlib import pyplot as plt
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sktime.forecasting.compose import make_reduction
 
 from src.models import *
 from src.data import get_danish_industry_consumption
+from tqdm import tqdm
 
-df = get_danish_industry_consumption()[["Privat"]]
-params = {
-    "objective": "regression",
-    "metric": "rmse",
-    "num_leaves": 50,
-    "min_child_samples": 1000,
-    "max_depth": 10,
-    "num_boost_round": 200,
-    "learning_rate": 0.1,
-    "verbosity": -1,
-    "linear_tree": True,
+os.environ["LOKY_MAX_CPU_COUNT"] = "2"
+
+
+def evaluate_nlar(df: pd.DataFrame):
+    prediction_length = 24
+    context_lags = list(range(48, 73)) + list(range(168, 168 + 25))
+
+    model = NonLinearAutoRegressive(
+        context_lags=context_lags,
+        country="Denmark",
+        prediction_length=prediction_length,
+        prediction_freq="d",
+    )
+
+    score = model.evaluate(df, cv_splits=3)
+    print(score.mean().mean())
+
+    print("Fitting model")
+    model.fit(df)
+    print("Predicting")
+    pred = model.predict(steps=3)
+
+    ax = pred.plot(linestyle="--", legend=False)
+    df.tail(200).plot(ax=ax, legend=False)
+    plt.show()
+
+
+df = get_danish_industry_consumption()
+df_sktime = (
+    df.tz_convert("UTC").tz_localize(None).asfreq("H").stack().to_frame("value")
+).sort_index()
+
+tscv = TimeSeriesSplit(n_splits=365, max_train_size=10000, test_size=24)
+dts = df_sktime.index.get_level_values(0).unique()
+
+forecasters = {
+    "knn_compose_multi": make_reduction(
+        KNeighborsRegressor(n_neighbors=100), window_length=168, strategy="multioutput"
+    ),
+    "knn_compose_rec": make_reduction(
+        KNeighborsRegressor(n_neighbors=100), window_length=168, strategy="recursive"
+    ),
+    "rf_compose_multi": make_reduction(
+        RandomForestRegressor(n_estimators=100, min_samples_leaf=100),
+        window_length=168,
+        strategy="multioutput",
+    ),
+    "exp_smooth": ExponentialSmoothing(
+        seasonal="add", sp=168, use_boxcox=True, use_brute=False
+    ),
+    "tbats": TBATS(
+        use_box_cox=True, euse_trend=False, sp=[168, 24], show_warnings=False
+    ),
 }
 
-prediction_length = 24
-context_lags = list(range(48, 73)) + list(range(168, 168 + 25))
 
-model = NonLinearAutoRegressive(
-    context_lags=context_lags,
-    country="Denmark",
-    prediction_length=prediction_length,
-    params=params,
-)
+prediction_horizon = range(48, 48 + 25)
 
-print("Fitting model")
-model.fit(df)
-print("Predicting")
-pred = model.predict(steps=3)
+preds = []
+for split, (train_index, test_index) in enumerate(tscv.split(dts)):
+    train_dts = dts[train_index]
+    test_dts = dts[test_index]
+    x_train = df_sktime.truncate(train_dts[0], train_dts[-1])
+    x_test = df_sktime.truncate(test_dts[0], test_dts[-1])
 
-ax = pred.plot(linestyle="--", legend=False)
-df.tail(200).plot(ax=ax, legend=False)
-plt.show()
+    for name, forecaster in forecasters.items():
+        print(f"--------- Training {name} on split {split+1}", end="\r")
+        forecaster.fit(x_train.swaplevel(), fh=prediction_horizon)
+        y_pred = forecaster.predict(prediction_horizon)["value"].to_frame(name)
+        preds.append(y_pred)
+    import ipdb
 
-# params_grid = {
-#     "num_leaves": [50, 200, 1000],
-#     "min_child_samples": [50, 100, 1000],
-#     "max_depth": [-1, 5, 10],
-#     "num_boost_round": [100, 200],
-# }
-# scores = pd.DataFrame()
-# for values in itertools.product(*params_grid.values()):
-#     new_params = params.copy()
-#     point = dict(zip(params_grid.keys(), values))
-#     new_params.update(point)
-#     model = NonLinearAutoRegressive(
-#         context_lags=context_lags,
-#         country="Denmark",
-#         prediction_length=prediction_length,
-#         params=new_params,
-#     )
-
-#     score = model.evaluate(df, cv_splits=3, max_train_size=10000, gap=48)
-#     point["score"] = round(score.mean().mean(), 4)
-#     scores = (
-#         pd.concat((scores, pd.Series(point).to_frame().T))
-#         .sort_values("scores")
-#         .reset_index()
-#     )
-#     print(scores)
-
-import ipdb
-
-ipdb.set_trace()
-
-# x, y = model.prepare_xy(df)
-# dataset = model.get_stacked_dataset(x, y)
-
-
-# # print(params)
-# score = model.evaluate(df, cv_splits=5, max_train_size=10000, gap=48)
-# weighted_score = (
-#     score.mean(axis=1) * df.abs().mean()
-# ).sum() / df.abs().mean().sum()
-# print(weighted_score)
-
-# model.fit(df.iloc[:-72])
-# pred = model.predict(df.iloc[:-72], steps=72)
-
-
-# import ipdb
-
-# ipdb.set_trace()
+    ipdb.set_trace()

@@ -4,3 +4,7 @@ scikit-learn
 lightgbm
 prophet
 holidays
+sktime
+numba
+statsmodels
+tbats

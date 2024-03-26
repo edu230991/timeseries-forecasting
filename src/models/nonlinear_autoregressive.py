@@ -1,28 +1,57 @@
 import warnings
 import holidays
+import inspect
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
 
 
 class NonLinearAutoRegressive:
+    dataset_kwargs = [
+        "linear_tree",
+        "max_bin",
+        "min_data_in_bin",
+    ]
+    dataset_params = None
+    default_params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "verbosity": 0,
+        "min_child_samples": 1000,
+        "num_leaves": 100,
+        "num_boost_round": 500,
+        "linear_tree": True,
+        "boosting": "dart",
+        "max_bin": 100,
+    }
+
     def __init__(
         self,
-        params: dict,
         country: str,
+        params: dict = {},
         context_lags: list = None,
         prediction_length: int = 1,
+        prediction_freq: str = None,
     ):
-        self.params = params
+
+        # check if any of the keywords belong to dataset for lgbm
+        for key in self.dataset_kwargs:
+            if key in params:
+                if self.dataset_params is None:
+                    self.dataset_params = {key: params.pop(key)}
+                else:
+                    self.dataset_params.update({key: params.pop(key)})
+
+        # check if any of the params belong to the train function
+        train_args = inspect.getfullargspec(lgb.train).args
+        self.train_kwargs = {k: v for k, v in params.items() if k in train_args}
+        [params.pop(k) for k in self.train_kwargs]
+
+        self.params = self.default_params
         self.country = country
-
-        if "linear_tree" in self.params:
-            self.dataset_params = {"linear_tree": self.params.pop("linear_tree")}
-        else:
-            self.dataset_params = None
-
         self.context_lags = context_lags
         self.prediction_length = prediction_length
+        self.prediction_freq = prediction_freq
 
     def validate_dataset(self, dataset: pd.DataFrame) -> pd.DataFrame:
         # make a copy of the dataset to make sure not to alter the original
@@ -64,9 +93,10 @@ class NonLinearAutoRegressive:
             if self.timestep != dataset.index[1] - dataset.index[0]:
                 raise ValueError(f"Dataset time frequency should be {self.timestep}")
 
+        self.categorical_features = [self.targets_name, "horizon"]
         return dataset
 
-    def expand_df(self, df: pd.DataFrame, labels: list, name: str):
+    def repeat_df(self, df: pd.DataFrame, labels: list, name: str):
         # repeat matrix n times
         dfdf = pd.concat({i: df for i in labels}, axis=1, names=[name])
         return dfdf
@@ -75,31 +105,50 @@ class NonLinearAutoRegressive:
         dataset = self.validate_dataset(dataset)
         cal_info = self.get_calendar_features(dataset.index)
 
+        if self.prediction_freq:
+            dts = pd.date_range(
+                start=dataset.index[0].ceil(self.prediction_freq),
+                end=dataset.index[-1].floor(self.prediction_freq),
+                freq=self.prediction_freq,
+                name=self.index_name,
+            )
+        else:
+            dts = dataset.index
         x = {}
         for i in self.context_lags:
-            x[i] = dataset.shift(i + 1).dropna().stack(future_stack=True)
+            x[i] = dataset.shift(i).dropna().reindex(dts).stack(future_stack=True)
 
         y = {}
         dataset.index = pd.MultiIndex.from_frame(cal_info.reset_index())
         for j in range(self.prediction_length):
-            y[j] = dataset.shift(-j).dropna().stack(future_stack=True)
+            y[j] = (
+                dataset.shift(-j)
+                .dropna()
+                .reindex(dts, level=0)
+                .stack(future_stack=True)
+            )
 
         x = pd.concat(x, axis=1, names=["features"]).dropna()
         y = pd.concat(y, axis=0, names=["horizon"]).dropna()
 
         x = x.reset_index()
-        y = y.to_frame("value").reset_index()
+        y = y.astype(float).to_frame("value").reset_index()
         x = x.merge(y, how="right", on=[self.index_name, self.targets_name]).dropna()
 
-        self.categorical_features = self.calendar_features + [
-            self.targets_name,
-            "horizon",
-        ]
-        x[self.categorical_features] = x[self.categorical_features].astype("category")
         y = x.set_index([self.index_name, self.targets_name, "horizon"])["value"]
         x = x.drop([self.index_name, "value"], axis=1)
         x.index = y.index
-        return x, y
+        x = self.ensure_types_and_order(x)
+
+        return x.sort_index(), y.sort_index()
+
+    def ensure_types_and_order(self, df: pd.DataFrame):
+        float_cols = {k: float for k in self.context_lags}
+        cat_cols = {k: "category" for k in self.categorical_features if k[:3] != "is_"}
+        bool_cols = {k: bool for k in self.categorical_features if k[:3] == "is_"}
+        df = df.astype({**float_cols, **cat_cols, **bool_cols})
+        df = df.reindex(self.context_lags + self.categorical_features, axis=1)
+        return df
 
     def get_calendar_features(self, index: pd.DatetimeIndex) -> pd.DataFrame:
         holiday_dict = holidays.country_holidays(self.country)
@@ -107,14 +156,21 @@ class NonLinearAutoRegressive:
         weekday = index.weekday
         is_holiday = pd.Series([d in holiday_dict for d in index.date], index=index)
         cal_df = pd.DataFrame(
-            {"hour": hour, "weekday": weekday, "is_holiday": is_holiday}
-        ).astype(int)
+            {
+                "hour": hour.astype(int),
+                "weekday": weekday.astype(int),
+                "is_holiday": is_holiday.astype(bool),
+            }
+        )
         cal_df.columns.name = "features"
         self.calendar_features = cal_df.columns.tolist()
+        if not all(
+            [col in self.categorical_features for col in self.calendar_features]
+        ):
+            self.categorical_features += self.calendar_features
         return cal_df
 
     def get_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
-        self.x_columns = x.columns
         data = lgb.Dataset(
             x,
             label=y,
@@ -123,15 +179,22 @@ class NonLinearAutoRegressive:
         )
         return data
 
-    def fit(self, dataset: pd.DataFrame):
+    def fit(self, dataset: pd.DataFrame, valid_share: float = 0.1):
         x, y = self.prepare_xy(dataset)
         self.dataset = dataset.copy()
-        x.to_pickle("x-new.pkl")
-        y.to_pickle("x-new.pkl")
+        if valid_share > 0:
+            x_val = x.sample(frac=valid_share, replace=False)
+            y_val = y.reindex(x_val.index)
+            x = x.drop(x_val.index, axis=0)
+            y = y.reindex(x.index)
+            valid_sets = [self.get_dataset(x_val, y_val)]
+        else:
+            valid_sets = []
 
         self.train_data = self.get_dataset(x, y)
-        with warnings.catch_warnings(action="ignore"):
-            self.model = lgb.train(self.params, self.train_data)
+        self.model = lgb.train(
+            self.params, self.train_data, valid_sets=valid_sets, **self.train_kwargs
+        )
 
     def prepare_x_pred(
         self, dataset: pd.DataFrame, cal_features: pd.DataFrame
@@ -140,17 +203,15 @@ class NonLinearAutoRegressive:
         x_pred = dataset.iloc[[-i - 1 for i in self.context_lags]].copy()
         x_pred = x_pred.T.sort_index(axis=1, ascending=False)
         x_pred.columns = pd.Index(self.context_lags, name="features")
-        x_pred = self.expand_df(x_pred, range(self.prediction_length), "horizon")
-        cal_features = self.expand_df(cal_features, self.targets, self.targets_name)
+        x_pred = self.repeat_df(x_pred, range(self.prediction_length), "horizon")
+        cal_features = self.repeat_df(cal_features, self.targets, self.targets_name)
 
         x_pred = x_pred.stack("horizon", future_stack=True)
         x_pred = x_pred.join(
             cal_features.stack(self.targets_name, future_stack=True)
         ).reset_index()
-        x_pred[self.categorical_features] = x_pred[self.categorical_features].astype(
-            "category"
-        )
-        return x_pred.reindex(self.x_columns, axis=1)
+        x_pred = self.ensure_types_and_order(x_pred)
+        return x_pred
 
     def predict(self, steps: int = 1) -> pd.DataFrame:
         n_timesteps = steps * self.prediction_length
@@ -169,7 +230,6 @@ class NonLinearAutoRegressive:
             this_cal_features.index.name = "horizon"
 
             x_pred = self.prepare_x_pred(self.dataset, this_cal_features)
-            x_pred.to_pickle("x_pred-new.pkl")
             this_pred = (
                 pd.Series(
                     self.model.predict(x_pred),
@@ -194,8 +254,8 @@ class NonLinearAutoRegressive:
         self,
         dataset: pd.DataFrame,
         cv_splits: int,
-        max_train_size: int,
-        gap: int,
+        max_train_size: int = None,
+        gap: int = 0,
         **kwargs,
     ) -> pd.DataFrame:
 
@@ -222,8 +282,9 @@ class NonLinearAutoRegressive:
 
             train_data = self.get_dataset(x_train, y_train)
             test_data = self.get_dataset(x_test, y_test)
-            with warnings.catch_warnings(action="ignore"):
-                self.model = lgb.train(self.params, train_data, valid_sets=[test_data])
+            self.model = lgb.train(
+                self.params, train_data, valid_sets=[test_data], **self.train_kwargs
+            )
 
             raw_test_data = test_data.get_data()
             self.y_pred = pd.Series(
