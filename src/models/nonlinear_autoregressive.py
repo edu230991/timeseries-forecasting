@@ -1,61 +1,56 @@
-import warnings
 import holidays
-import inspect
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import BaseEstimator
 
 
 class NonLinearAutoRegressive:
-    dataset_kwargs = [
-        "linear_tree",
-        "max_bin",
-        "min_data_in_bin",
-    ]
-    dataset_params = None
-    default_params = {
-        "objective": "regression",
-        "metric": "rmse",
-        "verbosity": 0,
+    params = {
+        "verbosity": -1,
         "min_child_samples": 1000,
         "num_leaves": 100,
-        "num_boost_round": 500,
+        "n_estimators": 500,
         "linear_tree": True,
-        "boosting": "dart",
-        "max_bin": 100,
+        # "boosting_type": "dart",
+        # "max_bin": 100,
     }
+    model = lgb.LGBMRegressor
 
     def __init__(
         self,
         country: str,
         params: dict = {},
         context_lags: list = None,
-        prediction_length: int = 1,
+        forecast_horizon: list = [1],
         prediction_freq: str = None,
+        model: BaseEstimator = None,
     ):
 
-        # check if any of the keywords belong to dataset for lgbm
-        for key in self.dataset_kwargs:
-            if key in params:
-                if self.dataset_params is None:
-                    self.dataset_params = {key: params.pop(key)}
-                else:
-                    self.dataset_params.update({key: params.pop(key)})
-
-        # check if any of the params belong to the train function
-        train_args = inspect.getfullargspec(lgb.train).args
-        self.train_kwargs = {k: v for k, v in params.items() if k in train_args}
-        [params.pop(k) for k in self.train_kwargs]
-
-        self.params = self.default_params
+        self.params.update(params)
         self.country = country
         self.context_lags = context_lags
-        self.prediction_length = prediction_length
+        self.forecast_horizon = forecast_horizon
         self.prediction_freq = prediction_freq
+
+        if model is not None:
+            if isinstance(model, type):
+                self.model = model(**self.params)
+            elif isinstance(model, BaseEstimator):
+                self.model = model
+        else:
+            self.model = self.model(**self.params)
 
     def validate_dataset(self, dataset: pd.DataFrame) -> pd.DataFrame:
         # make a copy of the dataset to make sure not to alter the original
         dataset = dataset.copy()
+
+        if isinstance(dataset.index, pd.MultiIndex) & (dataset.shape[1] == 1):
+            # dataset is sktime style
+            self.sktime_style = True
+            dataset = dataset.iloc[:, 0].unstack(0)
+        else:
+            self.sktime_style = False
 
         # check that column list is correct
         if hasattr(self, "targets"):
@@ -103,6 +98,7 @@ class NonLinearAutoRegressive:
 
     def prepare_xy(self, dataset: pd.DataFrame) -> tuple[pd.DataFrame]:
         dataset = self.validate_dataset(dataset)
+        self.dataset = dataset.copy()
         cal_info = self.get_calendar_features(dataset.index)
 
         if self.prediction_freq:
@@ -120,7 +116,7 @@ class NonLinearAutoRegressive:
 
         y = {}
         dataset.index = pd.MultiIndex.from_frame(cal_info.reset_index())
-        for j in range(self.prediction_length):
+        for j in self.forecast_horizon:
             y[j] = (
                 dataset.shift(-j)
                 .dropna()
@@ -170,80 +166,72 @@ class NonLinearAutoRegressive:
             self.categorical_features += self.calendar_features
         return cal_df
 
-    def get_dataset(self, x: pd.DataFrame, y: pd.DataFrame = None):
-        data = lgb.Dataset(
-            x,
-            label=y,
-            params=self.dataset_params,
-            free_raw_data=False,
-        )
-        return data
-
-    def fit(self, dataset: pd.DataFrame, valid_share: float = 0.1):
+    def fit(
+        self, dataset: pd.DataFrame, fh: list = None, valid_share: float = 0, **kwargs
+    ):
+        if fh is not None:
+            self.forecast_horizon = fh
         x, y = self.prepare_xy(dataset)
-        self.dataset = dataset.copy()
         if valid_share > 0:
             x_val = x.sample(frac=valid_share, replace=False)
             y_val = y.reindex(x_val.index)
             x = x.drop(x_val.index, axis=0)
             y = y.reindex(x.index)
-            valid_sets = [self.get_dataset(x_val, y_val)]
+            eval_set = [(x_val, y_val)]
         else:
-            valid_sets = []
+            eval_set = []
+        self.model.fit(x, y, eval_set=eval_set)
 
-        self.train_data = self.get_dataset(x, y)
-        self.model = lgb.train(
-            self.params, self.train_data, valid_sets=valid_sets, **self.train_kwargs
-        )
-
-    def prepare_x_pred(
-        self, dataset: pd.DataFrame, cal_features: pd.DataFrame
-    ) -> pd.DataFrame:
-
+    def prepare_x_pred(self, dataset: pd.DataFrame) -> pd.DataFrame:
         x_pred = dataset.iloc[[-i - 1 for i in self.context_lags]].copy()
         x_pred = x_pred.T.sort_index(axis=1, ascending=False)
         x_pred.columns = pd.Index(self.context_lags, name="features")
-        x_pred = self.repeat_df(x_pred, range(self.prediction_length), "horizon")
-        cal_features = self.repeat_df(cal_features, self.targets, self.targets_name)
-
+        x_pred = self.repeat_df(x_pred, self.forecast_horizon, "horizon")
         x_pred = x_pred.stack("horizon", future_stack=True)
-        x_pred = x_pred.join(
-            cal_features.stack(self.targets_name, future_stack=True)
-        ).reset_index()
+        x_pred[self.index_name] = (
+            x_pred.index.get_level_values(1) * self.timestep + dataset.index[-1]
+        )
+        cal_features = self.get_calendar_features(
+            pd.DatetimeIndex(x_pred[self.index_name])
+        ).set_index(x_pred.index)
+        x_pred = (
+            pd.concat([x_pred, cal_features], axis=1)
+            .reset_index()
+            .set_index(self.index_name)
+        )
         x_pred = self.ensure_types_and_order(x_pred)
         return x_pred
 
-    def predict(self, steps: int = 1) -> pd.DataFrame:
-        n_timesteps = steps * self.prediction_length
-        dtrange = pd.date_range(
-            start=self.dataset.index[-1] + self.timestep,
-            end=self.dataset.index[-1] + self.timestep * n_timesteps,
-            periods=n_timesteps,
-        )
-        cal_features = self.get_calendar_features(dtrange)
+    def predict(self, fh: list = None) -> pd.DataFrame:
+        if fh is None:
+            fh = self.forecast_horizon
+        if not isinstance(fh, pd.Series):
+            fh = pd.Series(fh)
 
+        dtrange = fh * self.timestep + self.dataset.index[-1]
+        fh = fh.set_axis(dtrange)
+
+        dataset = self.dataset.copy()
         preds = []
-        for i in range(steps):
-            this_cal_features = cal_features.iloc[
-                i * self.prediction_length : (i + 1) * self.prediction_length
-            ].reset_index(drop=True)
-            this_cal_features.index.name = "horizon"
-
-            x_pred = self.prepare_x_pred(self.dataset, this_cal_features)
+        while True:
+            x_pred = self.prepare_x_pred(dataset)
             this_pred = (
                 pd.Series(
                     self.model.predict(x_pred),
-                    index=x_pred.set_index(["horizon", self.targets_name]).index,
+                    index=x_pred.set_index(self.targets_name, append=True).index,
                 )
                 .unstack()
                 .sort_index()
             )
-            this_pred.index = self.dataset.index[-1] + (
-                self.timestep * (this_pred.index.astype(int) + 1)
-            )
             preds.append(this_pred)
-            self.dataset = pd.concat([self.dataset, this_pred])
-        preds = pd.concat(preds).sort_index()
+
+            if this_pred.index[-1] >= dtrange.max():
+                break
+
+            dataset = pd.concat([dataset, this_pred])
+        preds = pd.concat(preds).sort_index().reindex(dtrange)
+        if self.sktime_style:
+            preds = preds.stack().swaplevel().to_frame("value").sort_index()
         return preds
 
     def fit_predict(self, dataset: pd.DataFrame, steps: int = 1) -> pd.DataFrame:
@@ -280,16 +268,8 @@ class NonLinearAutoRegressive:
             y_train = y.reindex(x_train.index)
             y_test = y.reindex(x_test.index)
 
-            train_data = self.get_dataset(x_train, y_train)
-            test_data = self.get_dataset(x_test, y_test)
-            self.model = lgb.train(
-                self.params, train_data, valid_sets=[test_data], **self.train_kwargs
-            )
-
-            raw_test_data = test_data.get_data()
-            self.y_pred = pd.Series(
-                self.model.predict(raw_test_data), index=y_test.index
-            )
+            self.model.fit(x_train, y_train, eval_set=[(x_test, y_test)])
+            self.y_pred = pd.Series(self.model.predict(x_test), index=y_test.index)
 
             groupby = ["horizon", self.targets_name]
 

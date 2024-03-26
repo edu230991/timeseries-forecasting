@@ -8,6 +8,7 @@ def get_danish_industry_consumption(
     start: pd.Timestamp = None,
     end: pd.Timestamp = None,
     from_file: bool = True,
+    to_file: bool = False,
     size: int = None,
 ):
     filepath = os.path.join(DATA_DIR, "dk-ind-cons.pkl")
@@ -21,7 +22,8 @@ def get_danish_industry_consumption(
         endk = EnerginetData()
         df = endk.get_consumption_per_industry_code(start, end)
         df = df.pivot(columns="DK36Title", values="Consumption_MWh")
-        df.to_pickle(filepath)
+        if to_file:
+            df.to_pickle(filepath)
     if size is not None:
         df = df.iloc[:-size]
     return df
